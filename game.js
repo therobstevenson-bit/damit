@@ -59,9 +59,10 @@ const meta = loadMeta();
 function saveMeta() { localStorage.setItem("damit_meta", JSON.stringify(meta)); }
 
 function damWater() { return Math.min(100, meta.dam * 10); }
-function seasonTarget() { return Math.min(90, 45 + meta.season * 5); }
+// gentle early targets so the first winters are reachable; ramps up each season
+function seasonTarget() { return Math.min(85, 22 + meta.season * 8); }
 // costs scale with the valley you're in, so a fresh (bigger) valley re-absorbs your wood
-function damCost() { return Math.round((15 + meta.dam * 12) * meta.valley); }
+function damCost() { return Math.round((10 + meta.dam * 11) * meta.valley); }
 function lodgeCost() { return Math.round((25 + meta.lodge * 18) * meta.valley); }
 function colonyCost() { return Math.round((40 + meta.colony * 30) * meta.valley); }
 function canPrestige() { return meta.dam >= DAM_MAX && meta.lodge >= LODGE_MAX; }
@@ -104,6 +105,7 @@ const state = {
   refill: REFILL,
   lastEarned: 0,        // wood banked from the most recent run
   winterResult: null,   // {ok, text} banner shown on the home hub
+  frozen: false,        // the pond is iced over during the winter beat
   homeAt: 0,
   t: 0,                 // elapsed seconds, for idle animation
   soundOn: localStorage.getItem("damit_sound") !== "off",
@@ -202,6 +204,34 @@ function crunch(dur, gain, fStart, fEnd, q) {
   src.stop(t + dur + 0.02);
 }
 
+// crackly grit (sparse sharp grains) through a resonant lowpass — a proper wood crunch
+function crackle(dur, gain, freq, q) {
+  if (!state.soundOn) return;
+  const a = audio();
+  if (!a) return;
+  const t = a.currentTime;
+  const len = Math.max(1, (a.sampleRate * dur) | 0);
+  const buf = a.createBuffer(1, len, a.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) {
+    const env = Math.pow(1 - i / len, 1.6);
+    d[i] = (Math.random() < 0.5 ? Math.random() * 2 - 1 : 0) * env; // sparse grains = crackle
+  }
+  const src = a.createBufferSource();
+  src.buffer = buf;
+  const lp = a.createBiquadFilter();
+  lp.type = "lowpass";
+  lp.frequency.setValueAtTime(freq * 1.6, t);
+  lp.frequency.exponentialRampToValueAtTime(Math.max(90, freq * 0.4), t + dur);
+  lp.Q.value = q || 1;
+  const g = a.createGain();
+  g.gain.setValueAtTime(gain, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  src.connect(lp).connect(g).connect(a.destination);
+  src.start(t);
+  src.stop(t + dur + 0.02);
+}
+
 function noiseBurst(dur, gain, freq) {
   if (!state.soundOn) return;
   const a = audio();
@@ -224,11 +254,10 @@ function noiseBurst(dur, gain, freq) {
 
 const sfx = {
   chop(combo) {
-    const v = 0.66 + Math.random() * 0.78;           // wide per-chomp pitch swing (0.66..1.44)
-    crunch(0.15, 0.55, 3200 * v, 190 * v, 2.4);       // resonant woody crunch
-    crunch(0.05, 0.42, 6400 * v, 1700 * v, 1.1);      // sharp splintery crack
-    crunch(0.10, 0.30, 820 * v, 110 * v, 3.4);        // low body thunk w/ resonance
-    tone(120 * v + Math.min(combo, 20) * 7, 0.1, "triangle", 0.14, 70 * v);
+    const v = 0.62 + Math.random() * 0.86;            // big per-chomp pitch swing
+    crackle(0.16, 0.6, 1900 * v, 3.0);                 // crunchy grit — the meat of the bite
+    crunch(0.045, 0.4, 6200 * v, 1500 * v, 1.2);       // sharp splintery crack
+    tone(110 * v + Math.min(combo, 20) * 7, 0.09, "triangle", 0.13, 66 * v); // woody thunk
   },
   hit() {
     tone(300, 0.3, "sawtooth", 0.18, 70);
@@ -280,6 +309,7 @@ function startRun() {
   state.chompT = 0;
   state.dangerNow = false;
   state.deathT = 0;
+  state.frozen = false;
   state.segments = [];
   for (let i = 0; i < STACK; i++) state.segments.push(makeSegment(i > 2));
   particles.length = 0;
@@ -1349,17 +1379,21 @@ function goHome() {
 function resolveWinter() {
   const water = damWater();
   const target = seasonTarget();
+  state.frozen = true; // ice over the pond for the winter beat
   if (water >= target) {
     const bonus = 20 * meta.season * meta.valley;
     if (meta.colony < COLONY_MAX) meta.colony += 1;
     meta.wood += bonus;
     meta.season += 1;
-    state.winterResult = { ok: true, text: `Winter survived! 🍼 A kit is born — colony ${meta.colony}. +${bonus} 🪵 bonus.` };
+    state.winterResult = { ok: true, text: `❄ Winter survived! 🍼 A kit is born — colony ${meta.colony}. +${bonus} 🪵.` };
     tone(523, 0.12, "square", 0.15);
     setTimeout(() => tone(784, 0.16, "square", 0.15), 120);
     setTimeout(() => tone(1046, 0.2, "square", 0.15), 260);
   } else {
-    state.winterResult = { ok: false, text: `Winter came early: needed ${target}% water, had ${water}%. Maybe next year, eh — nothing lost.` };
+    meta.dam = 0; // the dam gives out under the ice
+    state.winterResult = { ok: false, text: `❄ Winter! The dam gave out and the pond froze over. Rebuild it — your wood, kits & valley are safe.` };
+    tone(220, 0.5, "sawtooth", 0.22, 70);
+    crackle(0.5, 0.35, 500, 2.5);
   }
   meta.runsLeft = SEASON_RUNS;
   saveMeta();
@@ -1414,7 +1448,7 @@ function handleHomeTap(mx, my) {
     if (pointIn(HOME_BTN.a, mx, my)) { buyDam(); return; }
     if (pointIn(HOME_BTN.b, mx, my)) { buyLodge(); return; }
   }
-  if (state.winterResult) state.winterResult = null;
+  if (state.winterResult) { state.winterResult = null; state.frozen = false; }
 }
 
 function drawButton(r, title, sub, enabled, accent, big) {
@@ -1505,12 +1539,57 @@ function drawKit(x, y, s) {
   ctx.restore();
 }
 
-function drawDamStructure(x, bottomY, topY) {
-  const logs = Math.max(1, Math.round((bottomY - topY) / 15));
-  for (let i = 0; i < logs; i++) {
-    const y = bottomY - 8 - i * 15;
+// a wall of stacked logs that grows with the water it holds back
+function drawDamWall(x, bedY, topY) {
+  const w = 32;
+  const rows = Math.max(1, Math.round((bedY - topY) / 13));
+  for (let i = 0; i < rows; i++) {
+    const y = bedY - 8 - i * 13;
     ctx.fillStyle = i % 2 ? "#7c5a34" : "#8b6a3f";
-    roundRect(x - 16, y - 7, 44, 13, 5);
+    roundRect(x - w / 2, y - 6, w, 12, 4);
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = "rgba(58,38,20,0.5)";
+    roundRect(x - w / 2, y - 6, w, 12, 4);
+    ctx.stroke();
+  }
+  // log ends (dots) for a woodpile read
+  ctx.fillStyle = "#caa06a";
+  for (let i = 0; i < rows; i += 1) {
+    const y = bedY - 8 - i * 13;
+    ctx.beginPath();
+    ctx.arc(x - w / 2 + 5, y, 2.4, 0, TAU);
+    ctx.fill();
+  }
+}
+
+// ice + falling snow over the creek during the winter beat
+function drawFreeze(cRim, bedY, damX, leftY, streamY) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, cRim, W, bedY - cRim + 14);
+  ctx.clip();
+  ctx.fillStyle = "rgba(224,238,248,0.86)";
+  ctx.fillRect(0, leftY - 2, damX, bedY - leftY + 16);
+  ctx.fillRect(damX, streamY - 2, W - damX, bedY - streamY + 16);
+  ctx.strokeStyle = "rgba(255,255,255,0.85)";
+  ctx.lineWidth = 1.5;
+  for (let i = 0; i < 6; i++) {
+    const bx = 20 + i * 58;
+    ctx.beginPath();
+    ctx.moveTo(bx, leftY + 4);
+    ctx.lineTo(bx + 18, leftY + 24);
+    ctx.lineTo(bx + 4, leftY + 44);
+    ctx.stroke();
+  }
+  ctx.restore();
+  // snow over the whole scene
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  for (let i = 0; i < 46; i++) {
+    const sx = (i * 137 + state.t * 26 * (0.5 + (i % 3) * 0.25)) % W;
+    const sy = (i * 71 + state.t * 55) % 700;
+    ctx.beginPath();
+    ctx.arc(sx, sy, 1.6 + (i % 2), 0, TAU);
     ctx.fill();
   }
 }
@@ -1523,73 +1602,83 @@ function drawHome() {
   ctx.fillStyle = sky;
   ctx.fillRect(0, 0, W, H);
 
-  drawRange(468, "#8aa6c6", "#eef4f8");
+  drawRange(430, "#8aa6c6", "#eef4f8");
   ctx.fillStyle = "#57b6e6";
-  drawCloud((state.t * 8) % (W + 160) - 80, 120, 0.8);
+  drawCloud((state.t * 8) % (W + 160) - 80, 110, 0.8);
 
-  // grassy bank
+  // grassy ground across the whole valley
   ctx.fillStyle = "#5aa845";
   ctx.fillRect(0, 452, W, H - 452);
   ctx.fillStyle = "#4f9a3f";
   ctx.fillRect(0, 452, W, 9);
 
-  // a pond sunk into the bank (shallow, so the lodge reads as a dome, not a tower)
-  const px = 95, pw = 350, pRim = 508, pBot = 660;
-  const span = pBot - pRim;
+  // ---- the creek runs the full width; the dam holds the water high on the LEFT ----
+  const cRim = 476, bedY = 650, streamY = 632, loMax = 496, damX = 350;
   const water = damWater(), target = seasonTarget();
-  const waterY = pBot - span * (water / 100);
-  const targetY = pBot - span * (target / 100);
-  const surfY = Math.min(waterY, pBot - 12); // always keep a sliver of water in the bed
+  const leftY = streamY - (streamY - loMax) * (water / 100); // left-pool surface rises with the dam
+  const targetY = streamY - (streamY - loMax) * (target / 100);
 
-  // muddy basin + darker rim
-  const bed = ctx.createLinearGradient(0, pRim, 0, pBot);
-  bed.addColorStop(0, "#6f4d2e");
-  bed.addColorStop(1, "#402a17");
-  ctx.fillStyle = bed;
-  roundRect(px - 8, pRim - 6, pw + 16, span + 14, 16);
-  ctx.fill();
-  ctx.lineWidth = 5;
-  ctx.strokeStyle = "rgba(48,32,18,0.55)";
-  roundRect(px - 8, pRim - 6, pw + 16, span + 14, 16);
-  ctx.stroke();
+  // dug channel (mud) full width
+  const bedGrad = ctx.createLinearGradient(0, cRim, 0, bedY);
+  bedGrad.addColorStop(0, "#6f4d2e");
+  bedGrad.addColorStop(1, "#402a17");
+  ctx.fillStyle = bedGrad;
+  ctx.fillRect(0, cRim, W, bedY - cRim + 12);
+  ctx.fillStyle = "rgba(40,26,15,0.45)";
+  ctx.fillRect(0, cRim, W, 5);
 
-  // lodge (drawn before the water so the water half-submerges it)
-  drawLodge(px + 92, pBot, pRim - 46, meta.lodge);
+  // lodge in the pond behind the dam (drawn before the water so it half-submerges)
+  drawLodge(150, bedY, loMax - 28, meta.lodge);
 
-  // translucent water clipped to the basin, with a bright surface line
+  // water: a high pool on the left of the dam, a low trickle on the right
   ctx.save();
-  roundRect(px, pRim, pw, span, 12);
-  ctx.clip();
-  ctx.fillStyle = "rgba(47,159,214,0.72)";
-  ctx.fillRect(px, surfY, pw, pBot - surfY + 4);
-  ctx.fillStyle = "rgba(165,216,240,0.9)";
   ctx.beginPath();
-  ctx.moveTo(px, surfY);
-  for (let x = px; x <= px + pw; x += 14) ctx.lineTo(x, surfY + Math.sin(x * 0.05 + state.t * 2) * 3);
-  ctx.lineTo(px + pw, surfY + 7);
-  ctx.lineTo(px, surfY + 7);
+  ctx.rect(0, cRim, W, bedY - cRim + 12);
+  ctx.clip();
+  ctx.fillStyle = "rgba(47,159,214,0.74)";
+  ctx.fillRect(0, leftY, damX, bedY - leftY + 12);
+  ctx.fillStyle = "rgba(47,159,214,0.58)";
+  ctx.fillRect(damX, streamY, W - damX, bedY - streamY + 12);
+  ctx.fillStyle = "rgba(170,218,240,0.9)";
+  ctx.beginPath();
+  ctx.moveTo(0, leftY);
+  for (let x = 0; x <= damX; x += 14) ctx.lineTo(x, leftY + Math.sin(x * 0.05 + state.t * 2) * 3);
+  ctx.lineTo(damX, leftY + 7);
+  ctx.lineTo(0, leftY + 7);
   ctx.closePath();
   ctx.fill();
+  ctx.fillRect(damX, streamY, W - damX, 3);
   ctx.restore();
 
-  // winter line
+  // overflow spilling over the dam
+  if (leftY < streamY - 8) {
+    ctx.fillStyle = "rgba(205,232,246,0.8)";
+    ctx.fillRect(damX - 2, leftY, 9, streamY - leftY);
+  }
+
+  // the dam wall (grows with the water it holds)
+  drawDamWall(damX, bedY, Math.min(leftY, streamY) - 3);
+
+  // winter line across the pool + colony swimming
   ctx.strokeStyle = "#eef7ff";
   ctx.lineWidth = 3;
   ctx.setLineDash([9, 7]);
   ctx.beginPath();
-  ctx.moveTo(px, targetY);
-  ctx.lineTo(px + pw, targetY);
+  ctx.moveTo(6, targetY);
+  ctx.lineTo(damX - 6, targetY);
   ctx.stroke();
   ctx.setLineDash([]);
   ctx.fillStyle = "#2c4a72";
-  ctx.font = "700 17px Trebuchet MS, sans-serif";
+  ctx.font = "700 16px Trebuchet MS, sans-serif";
   ctx.textAlign = "left";
-  ctx.fillText("❄ winter line", px + 6, targetY - 7);
+  ctx.fillText(`❄ need ${target}%`, 8, targetY - 6);
 
-  drawDamStructure(px + pw, pBot, surfY);
-  for (let i = 0; i < Math.min(meta.colony, 8); i++) {
-    drawKit(px + 196 + (i % 4) * 38, surfY - 2 + Math.floor(i / 4) * 18, 0.5);
+  const surf = Math.min(leftY, bedY - 14);
+  for (let i = 0; i < Math.min(meta.colony, 6); i++) {
+    drawKit(246 + (i % 3) * 34, surf - 2 + Math.floor(i / 3) * 18, 0.5);
   }
+
+  if (state.frozen) drawFreeze(cRim, bedY, damX, leftY, streamY);
 
   // header
   ctx.textAlign = "center";
@@ -1604,7 +1693,7 @@ function drawHome() {
   const rl = Math.max(0, meta.runsLeft);
   const line1 = meta.valley > 1 ? `Valley ${meta.valley}  ·  Season ${meta.season}` : `Season ${meta.season}`;
   ctx.fillText(line1, W / 2, 140);
-  ctx.fillText(`winter in ${rl} run${rl === 1 ? "" : "s"}  ·  water ${water}% / ${target}%`, W / 2, 166);
+  ctx.fillText(`${rl} run${rl === 1 ? "" : "s"} till ❄ winter  ·  pond ${water}%`, W / 2, 166);
 
   const since = (performance.now() - state.homeAt) / 1000;
   if (state.lastEarned > 0 && since < 2.4 && !state.winterResult) {
@@ -1623,17 +1712,17 @@ function drawHome() {
     const canLodge = meta.lodge < LODGE_MAX && meta.wood >= lodgeCost();
     drawButton(HOME_BTN.a,
       meta.dam >= DAM_MAX ? "🌊 Dam max" : "🌊 Raise Dam",
-      meta.dam >= DAM_MAX ? `${water}%` : `${damCost()}🪵 · +10%`,
+      meta.dam >= DAM_MAX ? "pond full" : `raises water · ${damCost()}🪵`,
       canDam, "#2f9fd6");
     drawButton(HOME_BTN.b,
       meta.lodge >= LODGE_MAX ? "🏠 Lodge max" : "🏠 Lodge",
-      meta.lodge >= LODGE_MAX ? `Lv ${meta.lodge}` : `${lodgeCost()}🪵 · Lv${meta.lodge + 1}`,
+      meta.lodge >= LODGE_MAX ? `Lv ${meta.lodge}` : `tougher runs · ${lodgeCost()}🪵`,
       canLodge, "#c9762e");
   }
   const canKit = meta.colony < COLONY_MAX && meta.wood >= colonyCost();
   drawButton(HOME_BTN.c,
     meta.colony >= COLONY_MAX ? "🍼 Colony full" : "🍼 Have a Kit",
-    meta.colony >= COLONY_MAX ? `${meta.colony} kits` : `${colonyCost()}🪵 · →${meta.colony + 1}`,
+    meta.colony >= COLONY_MAX ? `${meta.colony} kits` : `longer runs · ${colonyCost()}🪵`,
     canKit, "#e0883c");
   drawButton(HOME_BTN.play, "▶ PLAY", "chop some trees", true, "#3aa34a", true);
 
