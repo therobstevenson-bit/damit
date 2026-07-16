@@ -1,0 +1,9 @@
+# dependencies (none required to run the game)
+node_modules/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/
